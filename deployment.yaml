@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: default
+spec:
+  replicas: 4 # 4 реплики по результатам нагрузочного тестирования, но я бы скорее добавил еще один если есть возможность по ресурсам
+  revisionHistoryLimit: 10 # Храним историю ревизий для отката
+  
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25% # Постепенное обновление для минимизации простоя
+      maxUnavailable: 25% # Гарантируем доступность во время обновлений
+  
+  selector:
+    matchLabels:
+      app: web-app
+  
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1 # Максимальная разница в количестве подов между зонами
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway # Всегда планировать, даже если идеальное распределение невозможно
+        labelSelector:
+          matchLabels:
+            app: web-app
+      
+      # Предпочтительное распределение по нодам
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: web-app
+              topologyKey: kubernetes.io/hostname # Стараемся размещать на разных нодах
+      
+      containers:
+      - name: web-app
+        image: test-app
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            memory: "128Mi" # Ровное потребление памяти
+            cpu: "100m" # Минимальный запрос CPU  - 0,1 CPU
+          limits:
+            memory: "256Mi" # Лимит с запасом на случай нагрузки
+            cpu: "500m" # Лимит для обработки пиковых нагрузок при инициализации - 0,5 CPU
+        
+        # Настройки для медленно стартующего приложения
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          failureThreshold: 30 # 30 попыток = 150 секунд максимум
+          periodSeconds: 5 # Проверка каждые 5 секунд
+          timeoutSeconds: 3 # Таймаут проверки
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10 # Ждем 10 секунд перед первой проверкой
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 15 # Даем больше времени для инициализации
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 1
+        
+        ports:
+        - containerPort: 8080
+          name: http
+        
+        # Переменные окружения для оптимизации
+        env:
+        - name: JAVA_OPTS
+          value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+        - name: NODE_ENV
+          value: "production"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  
+  minReplicas: 2 # Минимум 2 реплики ночью для отказоустойчивости
+  maxReplicas: 8 # Максимум 8 реплик для дневного пика
+  
+  # Метрики для автоматического масштабирования
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60 # Целевая утилизация CPU 60%
+  
+  behavior:
+    # Настройки масштабирования для дневного цикла
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 60 # Можем увеличить на 2 пода в минуту
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    
+    scaleDown:
+      stabilizationWindowSeconds: 300 # 5 минут стабилизации перед уменьшением
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 180 # Уменьшаем медленно - 1 под в 3 минуты
+      - type: Percent
+        value: 10
+        periodSeconds: 180
+---
+apiVersion: v1
+kind: Service
+# простой сервис поскольку нет информации по архитектуре сети
+metadata:
+  name: web-app-service
+  namespace: default
+spec:
+  selector:
+    app: web-app
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  type: ClusterIP 
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  namespace: default
+spec:
+  minAvailable: 3 # Минимум 3 пода должны быть доступны всегда
+  selector:
+    matchLabels:
+      app: web-app
